@@ -1,0 +1,2078 @@
+---
+title: "GlcNac time course data analysis"
+author: "Francesco Tabaro"
+date: "`r Sys.Date()`"
+bibliography: references.bib
+link-citation: true
+nocite: "*"
+output:
+  html_document:
+    theme: cosmo
+    code_folding: hide
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    citation_package: natbib
+    highlight: tango
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r knitr_settings, include=FALSE}
+knitr::knit_hooks$set(
+  error = function(x, options) {
+    paste('\n\n<div class="alert alert-danger">',
+          gsub('##', '\n', gsub('^##\ Error', '**Error**', x)),
+          '</div>', sep = '\n')
+  },
+  warning = function(x, options) {
+    paste('\n\n<div class="alert alert-warning">',
+          gsub('##', '\n', gsub('^##\ Warning:', '**Warning**', x)),
+          '</div>', sep = '\n')
+  },
+  message = function(x, options) {
+    paste('\n\n<div class="alert alert-info">',
+          gsub('##', '\n', x),
+          '</div>', sep = '\n')
+  }
+)
+
+knitr::opts_hooks$set(
+  numberLines = function(options) {
+    attrs <- paste0("attr.", options$numberLines)
+    options[attrs] <- lapply(options[attrs], c, ".numberLines")
+    options
+  }
+)
+
+knitr::opts_chunk$set(
+  numberLines = c(
+    "source", "output"
+  )
+)
+
+knitr::opts_chunk$set(
+  fig.path = 'figures/',
+  fig.ext = '.png',
+  fig.dev = 'png',
+  fig.height = 5,
+  fig.width = 5
+)
+```
+
+```{r warn_user, warning=TRUE, echo=FALSE}
+message("Right-click a figure and select \"open in new tab\" to get a larger view.")
+```
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(patchwork)
+library(ComplexUpset)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Mm.eg.db)
+library(DT)
+library(dendextend)
+library(distances)
+library(pheatmap)
+library(mclust)
+library(RColorBrewer)
+library(decoupleR)
+```
+
+```{r define_helpers, message=FALSE, class.source='fold-hide', cache=TRUE}
+get_counts <- function(file_path, normalized) {
+  dds <- readRDS(file_path)
+  mat <- counts(dds, normalized = normalized)
+  as_tibble(mat, rownames = "gene_id")
+}
+
+get_results_table <- function(file_path){
+  tp <- basename(dirname(file_path))
+  
+  read_csv(file_path) %>%
+    dplyr::select(-1) %>%
+    dplyr::mutate(time_point = tp)
+  }
+
+to_matrix <- function(df) {
+  rn <- df$gene_id
+  mat <- as.matrix(df[,-1])
+  rownames(mat) <- rn
+  mat
+}
+
+get_all_counts <- function(normalized = FALSE) list.files(
+  "3t-seq/data/results/analysis/rdata/deseq2", 
+  pattern = "dds.rds", 
+  full.names = TRUE, 
+  recursive = TRUE) %>%
+  purrr::map(get_counts, normalized = normalized) %>%
+  purrr::reduce(dplyr::full_join, by = "gene_id") %>%
+  dplyr::select(-c(grep(".x.x.*", colnames(.)), grep(".y.*", colnames(.)))) %>%
+  dplyr::rename_with(sub, pattern = ".x", replacement = "") %>%
+  to_matrix
+
+# m is a matrix with one row per gene and one column per sample.
+mor <- function (m, threshold = 50, 
+                 add_one = TRUE,
+                 return_coefficients = FALSE, 
+                 use_median = FALSE,
+                 do_rounding = TRUE,
+                 digits = 5
+                ) {
+  
+  if(any(m<0, na.rm = TRUE)) stop("Negative counts detected. Aborting.", call. = FALSE)
+
+  ## shift all cells by 1.
+  if(add_one) {
+    cat("Adding 1 to all cells. Turn off with add_one=FALSE.\n", file = stderr())
+    m <- m + 1
+  }
+  
+  ## build consensus sample
+  if(use_median){
+    consensus <- apply(m, 1, median, na.rm = TRUE)
+  }else{
+    consensus <- exp(rowMeans(log(m), na.rm = TRUE)) # geometric mean          
+  }
+
+  ## compute median-of-ratios  
+  keep <- consensus > threshold
+  mors <- apply(m, 2, function (sample) { median(sample[keep] / consensus[keep], na.rm = TRUE) })
+    
+  ## normalize input
+  norm <- sapply(1:ncol(m), function (i) { m[,i] / mors[i] })
+  
+  ## round
+  if (do_rounding) {
+    norm <- round(norm, digits = digits)
+    if(return_coefficients) mors <- round(mors, digits = digits)
+  }
+  
+  ## keep colnames and rownames
+  colnames(norm) <- colnames(m)
+  rownames(norm) <- rownames(m)
+  
+  if(return_coefficients){
+    return(list(medians = consensus, 
+                coeff = mors, 
+                norm = norm))
+  }else{
+    return(norm)    
+  } 
+}
+
+create_dt <- function(x){
+  require(DT)
+  
+  page_len <- 10
+  if (nrow(x) < 10) {
+    page_len <- nrow(x)
+    length_menu <- "All"
+  } else if (nrow(x) >= 10 & nrow(x) < 25) { 
+    length_menu <- c(10)
+  } else if (nrow(x) >= 25 & nrow(x) < 50) {
+    length_menu <- c(10, 25)
+  } else if (nrow(x) >= 50) {
+    length_menu <- c(10, 25, 50)
+  }
+  
+  dt_options <- list(pageLength = page_len)
+  
+  if (!is.null(length_menu)) {
+    dt_options[["lengthMenu"]] <- length_menu
+    dt_options[["dom"]] <- "'Blfrtip'"
+  } else {
+    dt_options[["dom"]] <- "'Bfrtip'"
+  }
+  
+  dt_options[["pageLength"]] <- page_len
+  
+  datatable(as.data.frame(x), 
+            rownames = FALSE,
+            extensions = list(), 
+            options = dt_options)
+}
+
+create_go_dt <- function(x) {
+    if (nrow(x) > 0){
+      if ("Cluster" %in% colnames(x)) {
+        x <- x[,-which(colnames(x) == "Cluster")]
+      }
+      
+      ret <- x %>% 
+        as.data.frame %>%
+        dplyr::select(-c(ID, pvalue, qvalue)) %>%
+        dplyr::arrange(p.adjust) %>%
+        dplyr::mutate(p.adjust = format(p.adjust, 
+                                        scientific = TRUE, 
+                                        digits = 2)) %>%
+        dplyr::rename_with(tolower) %>%
+        dplyr::rename(`Adjusted p-value` = p.adjust) %>%
+        dplyr::rename_with(Hmisc::capitalize) %>%
+        create_dt()
+      return(ret)
+    } else {
+      warning("No GO terms enriched")
+    }
+}
+
+tpm <- function(dds) {
+  counts <- counts(dds, normalize = FALSE)
+  lengths <- width(rowRanges(dds))
+  rpk <- counts / (lengths / 1000)
+  scaling_factor <- colSums(rpk) / 1e6
+  tpm <- t(t(rpk) / scaling_factor)
+  return(tpm)
+}
+
+get_tpm <- function(p) {
+  dds <- readRDS(p)
+  tpm_matrix <- tpm(dds)
+  as_tibble(tpm_matrix, rownames = "gene_id")
+}
+
+get_all_tpm <- function() list.files(
+  "3t-seq/data/results/analysis/rdata/deseq2", 
+  pattern = "dds.rds", 
+  full.names = TRUE, 
+  recursive = TRUE) %>%
+  purrr::map(get_tpm) %>%
+  purrr::reduce(dplyr::full_join, by = "gene_id") %>%
+  dplyr::select(-c(grep(".x.x.*", colnames(.)), grep(".y.*", colnames(.)))) %>%
+  dplyr::rename_with(sub, pattern = ".x", replacement = "") %>%
+  to_matrix
+
+overlapGroups <- function (listInput, sort = TRUE) {
+  # listInput could look like this:
+  # $one
+  # [1] "a" "b" "c" "e" "g" "h" "k" "l" "m"
+  # $two
+  # [1] "a" "b" "d" "e" "j"
+  # $three
+  # [1] "a" "e" "f" "g" "h" "i" "j" "l" "m"
+  listInputmat    <- UpSetR::fromList(listInput) == 1
+  #     one   two three
+  # a  TRUE  TRUE  TRUE
+  # b  TRUE  TRUE FALSE
+  #...
+  # condensing matrix to unique combinations elements
+  listInputunique <- unique(listInputmat)
+  grouplist <- list()
+  # going through all unique combinations and collect elements for each in a list
+  for (i in 1:nrow(listInputunique)) {
+    currentRow <- listInputunique[i,]
+    myelements <- which(apply(listInputmat,1,function(x) all(x == currentRow)))
+    attr(myelements, "groups") <- currentRow
+    grouplist[[paste(colnames(listInputunique)[currentRow], collapse = ":")]] <- myelements
+    myelements
+    # attr(,"groups")
+    #   one   two three 
+    # FALSE FALSE  TRUE 
+    #  f  i 
+    # 12 13 
+  }
+  if (sort) {
+    grouplist <- grouplist[order(sapply(grouplist, function(x) length(x)), decreasing = TRUE)]
+  }
+  attr(grouplist, "elements") <- unique(unlist(listInput))
+  return(grouplist)
+  # save element list to facilitate access using an index in case rownames are not named
+}
+```
+
+We will begin by importing data and performing median of ratios normalization of the count matrix. The table below shows the initial number of genes and samples.
+
+```{r import_data, cache=TRUE}
+all_counts <- get_all_counts(normalized = FALSE)
+all_counts <- all_counts[apply(all_counts, 1, function(x) all(is.finite(x))),]
+all_counts_mor <- mor(all_counts, return_coefficients = FALSE, do_rounding = FALSE)
+all_tpm <- get_all_tpm()
+
+data.frame(row.names = c("genes", "samples"), values = dim(all_counts))
+```
+
+We will also import all DESeq2 results table as computed from 3t-seq.
+
+```{r import_results_table, cache=TRUE, message=FALSE}
+all_deseq2_results_tables <- list.files(
+  "3t-seq/data/results/analysis/tables/deseq2", 
+  pattern = "results.shrink.csv", 
+  full.names = TRUE, 
+  recursive = TRUE) %>%
+  purrr::map(get_results_table) %>%
+  purrr::reduce(bind_rows) %>%
+  dplyr::mutate(time_point = factor(time_point, 
+                                    levels = c("0_30", "0_2",
+                                               "0_4", "0_8",
+                                               "0_24", "0_48",
+                                               "0_7D", "0_WT",
+                                               "WT_WT7D")),
+                log2FoldChange = ifelse(time_point == "0_WT", -log2FoldChange, log2FoldChange))
+
+as.data.frame(all_deseq2_results_tables)
+```
+
+# Combine pairwise results
+
+We will produce a compound plot merging all Volcano and MA plots for pairwise analysis performed by 3t-seq.
+
+We begin by setting log2 fold-change and adjusted p-values threshold to call differentially expressed genes (DEG).
+
+```{r set_lfc_pval_thres, echo=FALSE, cache=TRUE}
+lfc_thr <- 0
+pval_thr <- 1e-2
+
+data.frame(row.names = c("log2FoldChange threshold", "Adjusted p-value threshold"), values = c(lfc_thr, pval_thr))
+```
+
+With these thresholds we proceed to call differentially expressed genes (DEG) in each time point. We produce a heatmap to summarize gene expression changes across all time points.
+
+```{r call_deg, cache=TRUE, fig.height=8, fig.width=8}
+all_deg <- all_deseq2_results_tables %>%
+  dplyr::mutate(deg = abs(log2FoldChange) > lfc_thr 
+                & ifelse(is.na(padj), pvalue < pval_thr, padj < pval_thr),
+                direction = sign(log2FoldChange))
+
+deg_mat <- all_counts_mor[rownames(all_counts_mor) %in% (all_deg %>% 
+                            dplyr::pull(gene_id) %>% 
+                            unique()),
+                          !grepl("WT", colnames(all_counts_mor))]
+
+colorder <- rep(c("0h", "30min", "2h", "4h", "8h", "24h", "48h", "7D"), each = 3)
+replicates <- paste0(rep("rep", 3), 1:3)
+labs <- expand.grid(colorder, replicates)
+labs <- paste(labs$Var1, labs$Var2, sep="_")
+
+hcc <- hclust(
+  distances::distance_matrix(
+    distances::distances(
+      scale(t(deg_mat), 
+            center = rowMeans(deg_mat), 
+            scale = rowSds(deg_mat)), 
+      id_variable = colnames(deg_mat)
+    )),
+  method = "ward.D")
+hcc <- dendextend::rotate(hcc, order = labs)  
+  
+pheatmap::pheatmap(deg_mat,
+                   scale = "row",
+                   cluster_cols = hcc,
+                   show_rownames = FALSE)
+```
+
+## Volcanos and MA plots
+
+We produce a side-by-side visualization of gene expression through Volcano plot and MA plots.
+
+```{r 3t-seq_merge_volcano_ma_plot, fig.width=20, fig.height=10, cache=TRUE, message=FALSE, warning=FALSE}
+
+
+pick_color <- function (deg_status, direction) {
+  if (length(deg_status) != length(direction)){ 
+    stop("Input vectors must have the same length.")
+  }
+  color <- rep("grey", length(deg_status))
+  color[deg_status & direction == 1] <- "blue"
+  color[deg_status & direction == -1] <- "red"
+  return(color)
+}
+
+labels <- c(`0_30` = "30min vs 0h",
+            `0_2` = "2h vs 0h",
+            `0_4` = "4h vs 0h",
+            `0_8` = "8h vs 0h",
+            `0_24` = "24h vs 0h",
+            `0_48` = "48h vs 0h",
+            `0_7D` = "7 days vs 0h",
+            `0_WT` = "0h vs WT",
+            `WT_WT7D` = "WT 7 days vs WT")
+
+volcano <- all_deg %>%
+  mutate(color = pick_color(deg, direction)) %>%
+  ggplot(aes(
+    x = log2FoldChange, 
+    y = -log10(padj), 
+    color = color)
+    ) +
+  geom_point(size = .75) +
+  geom_hline(
+    yintercept = -log10(pval_thr), 
+    color = "black") +
+  geom_vline(
+    xintercept = c(-lfc_thr, lfc_thr), 
+    color = "black") +
+  scale_color_identity() +
+  xlab("log2 Fold Change") +
+  ylab("-log10(adjusted p-value)") +
+  facet_wrap(facets = vars(time_point), ncol = 3,
+             labeller = labeller(time_point = labels)) +
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 1)
+
+ma_plot <- all_deg %>%
+  mutate(color = pick_color(deg, direction)) %>%
+  ggplot(aes(x = log10(baseMean), y = log2FoldChange, color = color)) +
+  geom_point(size = .75) +
+  geom_hline(
+    yintercept = c(-lfc_thr, lfc_thr), 
+    color = "black") +
+  scale_color_identity() +
+  xlab("Mean expression (log10)") +
+  ylab("log2 fold change") +
+  facet_wrap(facets = vars(time_point), ncol = 3,
+             labeller = labeller(time_point = labels)) + 
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 1)
+
+volcano + ma_plot
+```
+
+## Plot number of DEG across time points
+
+```{r number_of_deg_per_comparison, fig.height=10, fig.width=10, cache=TRUE}
+all_deg %>%
+  dplyr::group_by(time_point) %>%
+  dplyr::summarize(
+    upregulated = sum(deg & direction == 1, na.rm=TRUE),
+    downregulated = sum(deg & direction == -1, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(cols = c(upregulated, downregulated)) %>%
+  ggplot2::ggplot(aes(x = time_point, 
+                      y = value, 
+                      fill = name, 
+                      label = value)) +
+  ggplot2::geom_bar(stat = "identity", 
+                    position = "dodge", 
+                    color = "white") +
+  ggplot2::geom_text(mapping = aes(y = value + 50), 
+                     position = position_dodge(width = 0.9)) +
+  ggplot2::scale_x_discrete(labels = c(
+    `0_30` = "0h vs 30min",
+    `0_2` = "0h vs 2h",
+    `0_4` = "0h vs 4h",
+    `0_8` = "0h vs 8h",
+    `0_24` = "0h vs 24h",
+    `0_48` = "0h vs 48h",
+    `0_7D` = "0h vs 7 days",
+    `0_WT` = "0h vs WT 0h",
+    `WT_WT7D` = "WT 0h vs WT 7 days")) +
+  ggplot2::scale_fill_manual(name = "Direction", 
+                             labels = Hmisc::capitalize, 
+                             values = c(downregulated = "red", 
+                                        upregulated = "blue")) +
+  ggplot2::xlab("Comparison") +
+  ggplot2::ylab("Number of genes") +
+  ggplot2::theme_bw(base_size = 14) +
+  ggplot2::theme(aspect.ratio = 1, 
+                 axis.text.x = element_text(angle = 45, hjust = 1),
+                 legend.position = "bottom")
+```
+
+## Compute DEG shared across time points
+
+```{r upset_constants, cache=TRUE, class.source='fold-hide', warning=FALSE}
+my_theme <- upset_modify_themes(
+  list(
+    'default' = theme(
+      text = element_text(size = 16),
+      axis.text.x = element_text(size = 16)),
+    'intersections_matrix' = theme(
+      text = element_text(size = 16)
+    ),
+    'Intersection size' = theme(
+      text = element_text(size = 16)
+    ),
+    'overall_sizes' = theme(
+      text = element_text(size = 16),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  ))
+
+my_intersection_matrix <- intersection_matrix(
+            geom = geom_point(shape = 19, size = 2.5),
+            segment = geom_segment(
+              linetype = 'dotted', size = 0.25, color = "black"),
+            outline_color = list(active = 'black', inactive = 'grey90'))
+```
+
+To inspect how DEG are shared among time points and controls we will produce a [UpSet plot](https://en.wikipedia.org/wiki/UpSet_plot).
+
+We will produce two separate visualizations, one for upregulated, the other for downregulated genes.
+
+We will remove `0_7D` contrast as it generates a lot of noise and is not relevant.
+
+```{r upset_init, cache=TRUE}
+dat <- all_deg %>%
+  dplyr::filter(deg
+                & ! time_point == "0_7D") %>%
+  dplyr::mutate(direction = sign(log2FoldChange)) %>%
+  dplyr::select(gene_id, direction, time_point) %>%
+  dplyr::group_by(direction)
+  
+keys <- dat %>%
+  dplyr::group_data() %>%
+  dplyr::pull(direction)
+
+venn.data <- dat %>%
+  dplyr::group_by(direction) %>%
+  dplyr::group_split() %>%
+  purrr::set_names(keys)
+
+vd_complexUpset <- venn.data %>%
+  purrr::map(~.x %>% 
+               dplyr::select(-direction) %>% 
+               dplyr::mutate(val = TRUE) %>%
+               tidyr::pivot_wider(
+                 id_cols = gene_id, 
+                 names_from = time_point, 
+                 values_from = val, 
+                 values_fill = FALSE))
+```
+
+### Upregulated
+
+We will produce a UpSet plot showing all intersections with at least 5 elements.
+
+```{r upset_all_upregulated, fig.height=8, fig.width=14, cache=TRUE}
+venn.upregulated <- vd_complexUpset[["1"]] %>%
+  dplyr::select(-gene_id) %>%
+  as.data.frame
+
+time_points <- c("0_30", "0_2", "0_4", "0_8", "0_24", "0_48", "0_WT", "WT_WT7D")
+
+upset(
+  venn.upregulated,
+  intersect = rev(time_points),
+  sort_sets = FALSE,
+  name = NULL,
+  width_ratio = 0.1,
+  sort_intersections_by = c("degree", "cardinality"),
+  set_sizes = upset_set_size(),
+  wrap = FALSE,
+  themes = my_theme,
+  min_size = 5,
+  matrix = my_intersection_matrix
+  )
+```
+
+We will focus on a subset of more interesting intersections, ie. intersctions of consecutive time points.
+
+```{r upset_selected_upregulated, fig.height=8, fig.width=14, cache=TRUE}
+
+grouped_data <- venn.data[["1"]] %>% 
+  dplyr::group_by(time_point)
+
+keys <- grouped_data %>%
+  dplyr::group_keys() %>%
+  dplyr::pull("time_point")
+keys <- paste0("X", keys)
+
+L <- grouped_data %>% 
+  dplyr::group_split() %>% 
+  purrr::set_names(keys) %>%
+  purrr::map(dplyr::pull, "gene_id") 
+
+UpSetR::upset(
+  UpSetR::fromList(L),
+  intersections = list(
+    list(`0_30` = "X0_30", `0_2` = "X0_2", `0_4` = "X0_4", `0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48", `0_WT` = "X0_WT"),
+    list(`0_30` = "X0_30", `0_2` = "X0_2", `0_4` = "X0_4", `0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_2` = "X0_2", `0_4` = "X0_4", `0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_4` = "X0_4", `0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_24` = "X0_24", `0_48` = "X0_48")
+  ),
+  sets = c("X0_30","X0_2","X0_4","X0_8","X0_24","X0_48", "X0_WT"),
+  keep.order = TRUE,
+  order.by = "degree",
+  decreasing = TRUE,
+  text.scale = 1.5
+  )
+```
+
+Next, we will pull out the gene lists corresponding to these intersections and compute GO terms enrichments on those.
+
+```{r go_enrichment_upregulated_shared_genes, cache=TRUE, fig.height=9, fig.width=7, cache=TRUE}
+
+x <- overlapGroups(L %>% purrr::discard_at("XWT_WT7D"))
+
+genes <- list(
+  `X0_30:X0_2:X0_4:X0_8:X0_24:X0_48:X0_WT` = attr(x, "elements")[x[["X0_30:X0_2:X0_4:X0_8:X0_24:X0_48:X0_WT"]]],
+  `X0_30:X0_2:X0_4:X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_30:X0_2:X0_4:X0_8:X0_24:X0_48"]]],
+  `X0_2:X0_4:X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_2:X0_4:X0_8:X0_24:X0_48"]]],
+  `X0_4:X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_4:X0_8:X0_24:X0_48"]]],
+  `X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_8:X0_24:X0_48"]]],
+  `X0_24:X0_48` = attr(x, "elements")[x[["X0_24:X0_48"]]]
+) %>%
+  purrr::map2(.y = names(.), ~tibble(gene_id = .x, intersection = .y)) %>%
+  purrr::reduce(bind_rows) %>%
+  dplyr::mutate(gene_id = paste0("MGI:", gene_id))
+
+universe <- all_deg %>%
+  pull(gene_id) %>%
+  unique() %>%
+  paste0("MGI:", .)
+
+ck_upset_up <- compareCluster(gene_id ~ intersection, 
+                     data = genes, 
+                     fun = enrichGO,
+                     OrgDb = 'org.Mm.eg.db',
+                     keyType = "MGI",
+                     ont = "BP",
+                     universe = universe,
+                     minGSSize = 15)
+
+ck_upset_up <- setReadable(ck_upset_up, OrgDb = org.Mm.eg.db, keyType = "MGI")
+
+dotplot(ck_upset_up, 
+        x = "intersection", 
+        showCategory = 2) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        text = element_text(size=16),
+        axis.title = element_text(size=16),
+        axis.text.y = element_text(size=14))
+```
+
+Tables below show detailed results.
+
+```{r split_ck_shared_degs_up, echo=FALSE, cache=TRUE}
+splitted_upset_up <- as.data.frame(ck_upset_up) %>%
+  group_by(Cluster) %>%
+  group_split()
+```
+
+###  {.tabset}
+
+#### 0_30 & 0_2 & 0_4 & 0_8 & 0_24 & 0_48 & 0_WT
+
+```{r go_up_X0_30:X0_2:X0_4:X0_8:X0_24:X0_48:X0_WT, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_up[[3]])
+```
+
+#### 0_30 & 0_2 & 0_4 & 0_8 & 0_24 & 0_48
+
+```{r go_up_X0_30:X0_2:X0_4:X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_up[[2]])
+```
+
+#### 0_2 & 0_4 & 0_8 & 0_24 & 0_48
+
+```{r go_up_X0_2:X0_4:X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+warning("No enriched terms.")
+```
+
+#### 0_4 & 0_8 & 0_24 & 0_48
+
+```{r go_up_X0_4:X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+warning("No enriched terms.")
+```
+
+#### 0_8 & 0_24 & 0_48
+
+```{r go_up_X0_8:X0_24:X0_48, cache=TRUE}
+create_go_dt(splitted_upset_up[[4]])
+```
+
+#### 0_24 & 0_48
+
+```{r go_up_X0_24:X0_48, cache=TRUE}
+create_go_dt(splitted_upset_up[[1]])
+```
+
+###  {.unnumbered}
+
+### Downregulated
+
+```{r upset_all_downregulated, fig.height=8, fig.width=14, cache=TRUE}
+
+venn.downregulated <- vd_complexUpset[["-1"]] %>%
+  dplyr::select(-gene_id)
+
+time_points <- colnames(venn.downregulated)
+
+upset(
+  venn.downregulated,
+  intersect = rev(time_points),
+  sort_sets = FALSE,
+  name = NULL,
+  width_ratio = 0.1,
+  sort_intersections_by = c("degree", "cardinality"),
+  set_sizes = upset_set_size(),
+  wrap = FALSE,
+  themes = my_theme,
+  min_size = 5,
+  matrix = my_intersection_matrix
+  )
+```
+
+Similarly to upregulated genes, we will produce a UpSet plot showing the number of DEG shared across consecutive time points.
+
+```{r upset_selected_downregulated, fig.height=8, fig.width=14, cache=TRUE}
+
+grouped_data <- venn.data[["-1"]] %>% 
+  dplyr::group_by(time_point)
+
+keys <- grouped_data %>%
+  dplyr::group_keys() %>%
+  dplyr::pull("time_point")
+keys <- paste0("X", keys)
+
+L <- grouped_data %>% 
+  dplyr::group_split() %>% 
+  purrr::set_names(keys) %>%
+  purrr::map(dplyr::pull, "gene_id") 
+
+UpSetR::upset(
+  UpSetR::fromList(L),
+  intersections = list(
+    list(`0_30` = "X0_30", `0_2` = "X0_2", `0_4` = "X0_4", 
+         `0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_2` = "X0_2", `0_4` = "X0_4", `0_8` = "X0_8", 
+         `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_4` = "X0_4", `0_8` = "X0_8", `0_24` = "X0_24", 
+         `0_48` = "X0_48"),
+    list(`0_8` = "X0_8", `0_24` = "X0_24", `0_48` = "X0_48"),
+    list(`0_24` = "X0_24", `0_48` = "X0_48")
+  ),
+  sets = c("X0_30","X0_2","X0_4","X0_8","X0_24","X0_48"),
+  keep.order = TRUE,
+  order.by = "freq",
+  decreasing = FALSE,
+  text.scale = 1.5
+  )
+```
+
+We will compute GO Enrichment also for the sets of shared downregulated genes.
+
+```{r go_enrichment_downregulated_shared_genes, fig.height=9, fig.width=7, cache=TRUE}
+
+x <- overlapGroups(L %>% purrr::discard_at("XWT_WT7D"))
+
+genes <- list(
+  `X0_30:X0_2:X0_4:X0_8:X0_24:X0_48:X0_WT` = attr(x, "elements")[x[["X0_30:X0_2:X0_4:X0_8:X0_24:X0_48:X0_WT"]]],
+  `X0_30:X0_2:X0_4:X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_30:X0_2:X0_4:X0_8:X0_24:X0_48"]]],
+  `X0_2:X0_4:X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_2:X0_4:X0_8:X0_24:X0_48"]]],
+  `X0_4:X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_4:X0_8:X0_24:X0_48"]]],
+  `X0_8:X0_24:X0_48` = attr(x, "elements")[x[["X0_8:X0_24:X0_48"]]],
+  `X0_24:X0_48` = attr(x, "elements")[x[["X0_24:X0_48"]]]
+) %>%
+  purrr::map2(.y = names(.), ~tibble(gene_id = .x, intersection = .y)) %>%
+  purrr::reduce(bind_rows) %>%
+  dplyr::mutate(gene_id = paste0("MGI:", gene_id))
+
+universe <- all_deg %>%
+  pull(gene_id) %>%
+  unique() %>%
+  paste0("MGI:", .)
+
+ck_upset_down <- compareCluster(gene_id ~ intersection, 
+                     data = genes, 
+                     fun = enrichGO,
+                     OrgDb = 'org.Mm.eg.db',
+                     keyType = "MGI",
+                     ont = "BP",
+                     universe = universe,
+                     minGSSize = 15)
+
+ck_upset_down <- setReadable(ck_upset_down, OrgDb = org.Mm.eg.db, keyType = "MGI")
+
+dotplot(ck_upset_down, 
+        x = "intersection", 
+        showCategory = 2) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        text = element_text(size=16),
+        axis.title = element_text(size = 16),
+        axis.text.y = element_text(size = 14))
+```
+
+Tables below show detailed results.
+
+```{r split_ck_shared_degs_down, echo=FALSE, cache=TRUE}
+splitted_upset_down <- as.data.frame(ck_upset_down) %>%
+  group_by(Cluster) %>%
+  group_split()
+```
+
+###  {.tabset}
+
+#### 0_30 & 0_2 & 0_4 & 0_8 & 0_24 & 0_48 & 0_WT
+
+```{r go_down_X0_30:X0_2:X0_4:X0_8:X0_24:X0_48:X0_WT, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_down[[4]])
+```
+
+#### 0_30 & 0_2 & 0_4 & 0_8 & 0_24 & 0_48
+
+```{r go_down_X0_30:X0_2:X0_4:X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_down[[3]])
+```
+
+#### 0_2 & 0_4 & 0_8 & 0_24 & 0_48
+
+```{r go_down_X0_2:X0_4:X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_down[[1]])
+```
+
+#### 0_4 & 0_8 & 0_24 & 0_48
+
+```{r go_down_X0_4:X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_down[[5]])
+```
+
+#### 0_8 & 0_24 & 0_48
+
+```{r go_down_X0_8:X0_24:X0_48, cache=TRUE, echo=FALSE}
+warning("No enriched terms.")
+```
+
+#### 0_24 & 0_48
+
+```{r go_down_X0_24:X0_48, cache=TRUE, echo=FALSE}
+create_go_dt(splitted_upset_down[[2]])
+```
+
+###  {.unnumbered}
+
+## Plot OGT and OGA genes expression over time
+
+```{r plot_oga_ogt_expression_over_time, message=FALSE, fig.width=10, fig.height=10, cache=TRUE}
+
+ogt <- "MGI:1339639"
+oga <- "MGI:1932139"
+
+labs <- c("MGI:1339639" = "Ogt", 
+          "MGI:1932139" = "Oga")
+
+all_tpm %>%
+  dplyr::as_tibble(rownames = "gene_id") %>%
+  dplyr::filter(gene_id %in% c(ogt, oga)) %>%
+  tidyr::pivot_longer(cols = -gene_id) %>%
+  dplyr::mutate(
+    tp = sapply(str_split(name, "_"), `[`, 1),
+    rep = sapply(str_split(name, "_"), `[`, 2)
+  ) %>%
+  dplyr::filter(!grepl("WT", tp)) %>%
+  ggplot2::ggplot(mapping = aes(x = tp, 
+                               y = value, 
+                               group = gene_id, 
+                               color = gene_id, 
+                               fill = gene_id)) +
+  ggplot2::geom_jitter(width = 0.1) +
+  ggplot2::geom_smooth(method = stats::loess) + 
+  ggplot2::scale_color_discrete(labels = labs, name = "Gene") +
+  ggplot2::scale_fill_discrete(labels = labs, name = "Gene") + 
+  ggplot2::scale_x_discrete(name = "Time points",
+                           labels = c("0h", "30min", 
+                                      "2h", "4h", 
+                                      "8h", "24h", 
+                                      "48h", "7D")) +
+  ggplot2::ylab("TPM") +
+  ggplot2::theme_bw(base_size = 16) +
+  ggplot2::theme(aspect.ratio = 9/16,
+                 legend.position = "bottom")
+```
+
+# Plot RPL and RPS genes expression over time
+
+We manually searched for ribosomal genes on the Mouse Genetics Informatics (MGI) website. We downloaded the results in CSV format and will use it to subset our gene expression table for ribosomal genes of interest.
+
+```{r get_MGI, message=FALSE, cache=TRUE}
+mgi_search_results <- read_csv("MGI_Features_20240610_071948.csv") %>%
+  dplyr::filter(Type != "pseudogene" 
+                & Start != "syntenic" 
+                & !`Best Match Type` %in% c("Protein Domain", "old name", "Process") 
+                & Chr != "MT")
+```
+
+```{r datatable_RPL_RPS_genes, echo=FALSE, cache=TRUE}
+create_dt(mgi_search_results)
+```
+
+We will produce a clustered heatmap of Z-scores to show expression trends.
+
+```{r heatmap_RPL_RPS_genes, fig.width=8, fig.height=8, cache=TRUE}
+selected_mgi <- mgi_search_results %>% pull("MGI ID")
+
+print(sum(selected_mgi %in% rownames(all_counts_mor)) / length(selected_mgi) * 100)
+
+print(setdiff(selected_mgi, rownames(all_counts_mor)))
+
+mat <- all_counts_mor[rownames(all_counts_mor) %in% selected_mgi,
+                      !grepl("WT", colnames(all_counts_mor))] 
+
+colorder <- rep(c("0h", "30min", "2h", "4h", "8h", "24h", "48h", "7D"), each = 3)
+replicates <- paste0(rep("rep", 3), 1:3)
+labs <- expand.grid(colorder, replicates)
+labs <- paste(labs$Var1, labs$Var2, sep="_")
+
+hcc <- hclust(
+  distances::distance_matrix(
+    distances::distances(
+      scale(t(mat), 
+            center = rowMeans(mat), 
+            scale = rowSds(mat)), 
+      id_variable = colnames(mat)
+    )),
+  method = "ward.D")
+hcc <- dendextend::rotate(hcc, order = labs)  
+
+hcr <- hclust(
+  d = dist(t(scale(t(mat), center = rowMeans(mat), scale= rowSds(mat))), method = "euclidean"),
+  method = "complete"
+)
+
+clusters <- data.frame(row.names = rownames(mat),
+                       gene_id = rownames(mat), 
+                       cluster = as.factor(cutree(hcr, 2)))
+
+pheatmap::pheatmap(
+  mat,
+  cluster_cols = hcc,
+  cluster_rows = hcr,
+  scale = "row",
+  show_rownames = FALSE,
+  main = "RPL and RPS genes (Z-score)",
+  cutree_rows = 2,
+  annotation_row = subset(clusters, select = -1)
+)
+```
+
+```{r plot_rpl_rps_by_cluster, fig.width=10, fig.height=5, cache=TRUE, message=FALSE}
+mat <- t(scale(t(mat), center = rowMeans(mat), scale = rowSds(mat)))
+
+dat <- mat %>%
+  dplyr::as_tibble(rownames = "gene_id") %>%
+  dplyr::inner_join(clusters) %>%
+  tidyr::pivot_longer(cols = -c(gene_id, cluster)) %>%
+  dplyr::mutate(time_point = sapply(str_split(name, "_"), `[`, 1),
+         replicate = sapply(str_split(name, "_"), `[`, 2),
+         time_point = factor(time_point, levels = c("0h", "30min", "2h", "4h", "8h", "24h", "48h", "7D"))) %>%
+  dplyr::group_by(gene_id, time_point, cluster) %>%
+  dplyr::summarise(exp = mean(value)) 
+
+avg <- dat %>%
+  group_by(time_point, cluster) %>%
+  summarise(mean_exp = median(exp))
+
+dat %>%
+  ggplot2::ggplot(aes(time_point, exp)) + 
+  ggplot2::geom_smooth(data = avg, mapping = aes(x =  time_point, y = mean_exp, group = cluster), color = "red") +
+  ggplot2::geom_boxplot(fill = NA) +
+  ggplot2::facet_wrap(~ cluster, labeller = labeller(cluster = c(`1` = "Cluster 1", `2` = "Cluster 2"))) +
+  ggplot2::ylab("Expression Z-score") +
+  ggplot2::theme_bw(base_size = 16) + 
+  ggplot2::theme(aspect.ratio = 1)
+```
+
+Tables below show the MGI search results table split by cluster.
+
+###  {.tabset}
+
+#### Cluster 1
+
+```{r print_rpl_rps_cluster_1, echo=FALSE, cache=TRUE}
+cluster1 <- clusters %>% filter(cluster == 1) %>% pull(gene_id)
+
+create_dt(mgi_search_results %>%
+  filter(`MGI ID` %in% cluster1))
+```
+
+#### Cluster 2
+
+```{r print_rpl_rps_cluster_2, echo=FALSE, cache=TRUE}
+cluster2 <- clusters %>% filter(cluster == 2) %>% pull(gene_id)
+
+create_dt(mgi_search_results %>%
+  filter(`MGI ID` %in% cluster2))
+```
+
+###  {.unnumbered}
+
+We will also produce a Volcano and MA plots highlighting significantly deregulated gene coding for ribosomal proteins.
+
+```{r ma_volcano_RPL_RPS_genes, fig.width=20, fig.height=10, warning=FALSE, cache=TRUE}
+pick_color <- function (gene_id, deg_status, direction) {
+  if (length(deg_status) != length(direction)){ 
+    stop("Input vectors must have the same length.")
+  }
+  color <- rep("grey", length(deg_status))
+  color[deg_status & direction == 1] <- "dodgerblue"
+  color[deg_status & direction == -1] <- "salmon"
+  color[deg_status
+        & direction == 1
+        & gene_id %in% mgi_search_results$`MGI ID`] <- "blue"
+  color[deg_status
+        & direction == -1
+        & gene_id %in% mgi_search_results$`MGI ID`] <- "red"
+  color[!deg_status
+        & direction == 1
+        & gene_id %in% mgi_search_results$`MGI ID`] <- "darkblue"
+  color[!deg_status
+        & direction == -1
+        & gene_id %in% mgi_search_results$`MGI ID`] <- "darkred"
+  return(color)
+}
+
+point_size <- 0.5
+
+legend_labels <-  c(dodgerblue = "Upregulated",
+                    salmon = "Downregulated",
+                    grey = "Gene",
+                    darkred = "Ribosomal upregulated N.S.",
+                    darkblue = "Ribosomal downregulated N.S.",
+                    red = "Ribosomal upregulated",
+                    blue = "Ribosomal downregulated")
+
+labels <- c(`0_30` = "30min vs 0h",
+            `0_2` = "2h vs 0h",
+            `0_4` = "4h vs 0h",
+            `0_8` = "8h vs 0h",
+            `0_24` = "24h vs 0h",
+            `0_48` = "48h vs 0h",
+            `0_7D` = "7 days vs 0h",
+            `0_WT` = "0h vs WT",
+            `WT_WT7D` = "WT 7 days vs WT")
+
+
+volcano <- all_deg %>%
+  mutate(color = pick_color(gene_id, deg, direction)) %>%
+  ggplot(aes(
+    x = log2FoldChange, 
+    y = -log10(padj), 
+    color = color)
+    ) +
+  geom_point(size = point_size) +
+  geom_point(
+    data = all_deg %>%
+      mutate(color = pick_color(gene_id, deg, direction)) %>%
+      filter(gene_id %in% mgi_search_results$`MGI ID`),
+    size = point_size
+  ) +
+  geom_hline(
+    yintercept = -log10(pval_thr), 
+    color = "black") +
+  geom_vline(
+    xintercept = c(-lfc_thr, lfc_thr), 
+    color = "black") +
+  scale_color_identity(
+    guide = "legend", 
+    name = "", 
+    labels = legend_labels) +
+  guides(colour = guide_legend(override.aes = list(size = 4))) + 
+  xlab("log2 Fold Change") +
+  ylab("-log10(adjusted p-value)") +
+  facet_wrap(facets = vars(time_point), ncol = 3,
+             labeller = labeller(time_point = labels)) + 
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 1, 
+        legend.position = "bottom")
+
+ma_plot <- all_deg %>%
+  mutate(color = pick_color(gene_id, deg, direction)) %>%
+  ggplot(aes(x = log10(baseMean), y = log2FoldChange, color = color)) +
+  geom_point(size = point_size) +
+  geom_point(
+    data = all_deg %>%
+      mutate(color = pick_color(gene_id, deg, direction)) %>%
+      filter(gene_id %in% mgi_search_results$`MGI ID`),
+    size = point_size
+  ) +
+  geom_hline(
+    yintercept = c(-lfc_thr, lfc_thr), 
+    color = "black") +
+  scale_color_identity(
+    guide = "legend", 
+    name = "", 
+    labels = legend_labels) +
+  guides(colour = guide_legend(override.aes = list(size = 4))) + 
+  xlab("Mean expression (log10)") +
+  ylab("log2 fold change") +
+  facet_wrap(facets = vars(time_point), ncol = 3,
+             labeller = labeller(time_point = labels)) + 
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 1, 
+        legend.position = "bottom")
+
+volcano + ma_plot + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+# Principal Component Analysis
+
+## All samples
+
+We will compute PCA using all replicates from all samples across all time points. We will compute it on median-of-ratios normalized counts.
+
+The plot shows a large contribution of time on PC1 and the genetic background emerge on PC2.
+
+```{r PCA, fig.width=7, fig.height=5, cache=TRUE}
+do_pca <- function(mat, legend_labels) {
+  pc <- prcomp(t(mat), center = TRUE, scale = TRUE)
+  
+  tp <- sapply(strsplit(colnames(mat), "_", fixed = TRUE), `[[`, 1)
+  tp <- factor(tp, levels = legend_labels)
+  colors <- as.numeric(tp)
+  
+  is_wt <- grepl("WT", colnames(mat))
+  shape <- ifelse(is_wt, 17, 19)
+  
+  perc_sdev <- pc$sdev / sum(pc$sdev) * 100
+  pc1 <- sprintf("PC1 (%.1f%%)", perc_sdev[1])
+  pc2 <- sprintf("PC2 (%.1f%%)", perc_sdev[2])
+  
+  par(mar = c(4,4,2,8.5), pty = "s")
+  plot(pc$x[,1], pc$x[,2], col = colors, pch = shape, xlab = pc1, ylab = pc2)
+  lx <- ceiling(max(pc$x[,1])) + ceiling(max(pc$x[,1]) * 0.1)
+  ly <- ceiling(max(pc$x[,2]))
+  legend(x = lx, y = ly,
+    legend = levels(tp), 
+    col = 1:length(levels(tp)), 
+    pch = ifelse(grepl("WT", levels(tp)), 17, 19),
+    horiz = FALSE, 
+    ncol = 2, 
+    xpd = TRUE)
+}
+
+do_pca(all_counts_mor, 
+       legend_labels = c("0h", "30min", "2h", "4h", "8h", "24h", "48h", "7D", "WT", "WT7D"))
+```
+
+## Without WT
+
+We will explore how the median of ratios normalization affects PCA. We will go back to the raw counts, remove WT samples, re-run the median of ratios normalization and PCA.
+
+The scatterplot of the first two components looks substantially different than previous iterations. The effect of time is spread in diagonal between PC1 and PC2.
+
+```{r PCA_no_wt_with_mor, fig.width=7.25, fig.height=5, cache=TRUE}
+mat <- all_counts
+mat <- mat[,-grep("WT", colnames(mat))]
+mat_mor <- mor(mat, return_coefficients = FALSE, do_rounding = FALSE)
+
+do_pca(mat, 
+       legend_labels = c("0h", "30min", "2h", "4h", "8h", "24h", "48h", "7D"))
+```
+
+# Time-course analysis
+
+We will start by median-of-ratios (mor) normalized counts and compute Z-scores. We will filter for genes with at least 50 mor-normalized read counts and with a variance value above the lower quartile value of the global variances distribution. We will compute Z-scores on this filtered gene expression matrix.
+
+```{r time_course_analysis, cache=TRUE, message=FALSE}
+colorder <- c("0h", "30min", "2h", "4h", "8h", "24h", "48h")
+
+mat <- all_counts_mor[,-c(grep("7D", colnames(all_counts_mor)), 
+                          grep("WT", colnames(all_counts_mor)))]
+mat <- mat[rowSums(mat) > 50,]
+
+mat <- mat[rowVars(mat) > quantile(rowVars(mat), .25),]
+
+# t0_median <- rowMedians(mat[,grep("0h", colnames(mat))])
+
+norm <- t(scale(t(mat),
+        center = rowMeans(mat),
+        scale = rowSds(mat))) 
+
+as_matrix <- function(tbl) {
+  rn <- tbl$gene_id
+  mat <- as.matrix(tbl[,-which(colnames(tbl) == "gene_id")])
+  rownames(mat) <- rn
+  mat <- mat[,colorder]
+  return(mat)
+}
+
+norm <- norm %>%
+  as_tibble(rownames = "gene_id") %>%
+  pivot_longer(
+    cols = -gene_id,
+    names_to = "sample",
+    values_to = "expression"
+  ) %>%
+    mutate(time_point = sapply(str_split(sample, "_"), `[`, 1),
+         replicate = sapply(str_split(sample, "_"), `[`, 2)) %>%
+  group_by(gene_id, time_point) %>%
+  summarize(expression = median(expression)) %>%
+  pivot_wider(
+    id_cols = gene_id,
+    names_from = time_point,
+    values_from = expression
+  ) %>%
+  as_matrix
+```
+
+Next, we will use the `Mclust` package to estimate the number of clusters to split the dataset into. The package tests for a range of models and `k` values (number of clusters). We will test partitioning the dataset into up to 200 clusters, ie. `k = 1:200`. For each couple (model, cluster), calculates the Bayesian Information Content (BIC) value. It then picks the couple that maximizes the BIC score.
+
+```{r calculate_k, eval=FALSE, cache=TRUE}
+k_max <- 200
+
+d_clust <- Mclust(
+  norm,
+  G = 1:k_max,
+  modelNames = mclust.options("emModelNames")
+)
+
+plot(d_clust, what = "BIC")
+```
+
+```{r plot_d_clust, echo=FALSE, fig.width=7, fig.height=7, cache=TRUE}
+d_clust <- readRDS(file = "bic/rds/k_max-200.rds")
+
+plot(d_clust, what = "BIC")
+abline(v = 21, lwd = 2)
+abline(h = d_clust$BIC[21, "VVE"], lwd = 2)
+points(
+  21,
+  d_clust$BIC[21, "VVE"],
+  cex = 2,
+  pch = 20
+)
+```
+
+The best performing model is `VVE,21` (black dot in the plot above). This is a model using a multivariate Gaussian mixture model that uses ellipsoid kernels with equal orientations. We will proceed using the results from this clustering.
+
+We will split our dataset in 21 clusters. On top of the genes we used to generate clusters, we will predict cluster assignment for all remaining genes.
+
+```{r do_clustering, message=FALSE, fig.height=8.5, fig.width=15, cache=TRUE}
+
+ct <- d_clust$classification
+ct <- data.frame(gene_id = names(ct), cluster = ct)
+
+newdata <- norm[!rownames(norm) %in% ct$gene_id,]
+
+res <- predict(d_clust, newdata)
+
+ct <- rbind(ct,  
+            data.frame(
+              gene_id = rownames(newdata),
+              cluster = res$classification))
+
+dat <- norm %>%
+  as_tibble(rownames = "gene_id") %>%
+  inner_join(ct) %>%
+  pivot_longer(
+    cols = -c(gene_id, cluster),
+    names_to = "sample",
+    values_to = "expression") %>%
+  dplyr::rename(time_point = sample)
+
+sds <- dat %>%
+  group_by(time_point, cluster) %>%
+  summarize(sd = sd(expression),
+            expression = median(expression)) %>%
+  mutate(gene_id = "none",
+         sdmin = expression - sd,
+         sdmax = expression + sd)
+
+cluster_labels <- dat %>%
+  group_by(cluster) %>%
+  summarize(
+    n = length(unique(gene_id))) %>%
+  mutate(label = sprintf("cluster %d - n = %d", cluster, n)) %>%
+  pull(label, name = cluster)
+
+dat %>%
+  mutate(time_point = factor(time_point, levels = colorder)) %>%
+  ggplot(aes(x = time_point, group = gene_id)) +
+  geom_line(mapping = 
+              aes(y = expression), 
+            linewidth = 0.25, 
+            alpha = 0.33, 
+            color = "grey"
+  ) +
+  geom_ribbon(
+    data = sds,
+    mapping = aes(x = time_point, ymin = sdmin, ymax = sdmax),
+    fill = "dodgerblue",
+    alpha = 0.66
+  ) +
+  geom_line(
+    data = sds, 
+    mapping = aes(x = time_point, y = expression), 
+    color = "black") +
+  facet_wrap(~ cluster, labeller = labeller(cluster = cluster_labels)) +
+  theme_bw(base_size = 14) + 
+  theme(aspect.ratio = 9/16,
+        
+        panel.grid = element_blank(),
+        strip.background = element_blank())
+
+```
+
+We will proceed to characterize these clusters with GO enrichment.
+
+# Gene Ontology Enrichment Analysis
+
+## Clusters from time course analysis
+
+```{r GO_enrichment_time_course, cache = TRUE, fig.height=20, fig.width=10, cache=TRUE}
+time_based_clusters <- ct %>%
+  as_tibble() %>%
+  dplyr::mutate(gene_id = paste0("MGI:", gene_id))
+
+universe <- all_deg %>%
+  pull(gene_id) %>%
+  unique() %>%
+  paste0("MGI:", .)
+
+ck_time_course_clustering <- compareCluster(gene_id ~ cluster, 
+                     data = time_based_clusters, 
+                     fun = enrichGO,
+                     OrgDb = 'org.Mm.eg.db',
+                     keyType = "MGI",
+                     ont = "BP",
+                     universe = universe,
+                     minGSSize = 15)
+
+ck_time_course_clustering <- setReadable(ck_time_course_clustering, OrgDb = org.Mm.eg.db, keyType = "MGI")
+
+dotplot(ck_time_course_clustering, 
+        x = "cluster", 
+        showCategory = 2) + 
+  scale_x_discrete(limits = c("2", "3", "4", 
+                              "5", "6", "7", 
+                              "8", "9", "11", 
+                              "12", "14", "16", 
+                              "18", "20", "21")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        text = element_text(size=16),
+        axis.title = element_text(size=16),
+        axis.text.y = element_text(size=14))
+```
+
+Tables below report enriched GO terms for each cluster separately.
+
+```{r split_ck_time_clusters, echo=FALSE, cache=TRUE}
+splitted_time_based_clustering <- as.data.frame(ck_time_course_clustering) %>%
+  group_by(Cluster) %>%
+  group_split()
+```
+
+###  {.tabset}
+
+#### Cluster 2
+
+```{r go_cluster2, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[1]])
+```
+
+#### Cluster 3
+
+```{r go_cluster3, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[2]])
+```
+
+#### Cluster 4
+
+```{r go_cluster4, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[3]])
+```
+
+#### Cluster 5
+
+```{r go_cluster5, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[4]])
+```
+
+#### Cluster 6
+
+```{r go_cluster6, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[5]])
+```
+
+#### Cluster 7
+
+```{r go_cluster7, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[6]])
+```
+
+#### Cluster 8
+
+```{r go_cluster8, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[7]])
+```
+
+#### Cluster 9
+
+```{r go_cluster9, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[8]])
+```
+
+#### Cluster 11
+
+```{r go_cluster11, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[9]])
+```
+
+#### Cluster 12
+
+```{r go_cluster13, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[10]])
+```
+
+#### Cluster 14
+
+```{r go_cluster14, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[11]])
+```
+
+#### Cluster 16
+
+```{r go_cluster16, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[12]])
+```
+
+#### Cluster 17
+
+```{r go_cluster17, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[13]])
+```
+
+#### Cluster 19
+
+```{r go_cluster19, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[14]])
+```
+
+#### Cluster 20
+
+```{r go_cluster20, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[15]])
+```
+
+#### Cluster 21
+
+```{r go_cluster21, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_time_based_clustering[[16]])
+```
+
+###  {.unnumbered}
+
+## Pairwise comparisons
+
+The visualization below shows the top 5 enriched GO term per comparison. Dots size corresponds to the ratio of genes found in cluster to be annotated with a given term, over the total number of genes annotated with that term. Dots color maps to significance level (p-value).
+
+```{r clusterProfiler_compare_cluster, cache=TRUE, fig.width=10, fig.height=13}
+
+clusters <- all_deg %>%
+  dplyr::filter(deg) %>%
+  dplyr::mutate(gene_id = paste0("MGI:", gene_id)) %>%
+  dplyr::ungroup()
+
+universe <- all_deg %>%
+  pull(gene_id) %>%
+  unique() %>%
+  paste0("MGI:", .)
+
+ck_pairwise_comparisons <- compareCluster(gene_id ~ time_point + direction, 
+                     data = clusters, 
+                     fun = enrichGO,
+                     OrgDb = 'org.Mm.eg.db',
+                     keyType = "MGI",
+                     ont = "BP",
+                     universe = universe,
+                     minGSSize = 15)
+
+ck_pairwise_comparisons <- setReadable(ck_pairwise_comparisons, OrgDb = org.Mm.eg.db, keyType = "MGI")
+
+dotplot(ck_pairwise_comparisons, 
+        x = "time_point",
+        showCategory = 2) + 
+  facet_grid(~direction, 
+             labeller = labeller(
+               direction = c(`1` = "upregulated",
+                             `-1` = "downregulated"
+                             ))) +
+  scale_x_discrete(limits = c("0_30", "0_2", "0_4", 
+                              "0_8", "0_24", "0_48", 
+                              "0_7D", "0_WT", "WT_WT7D")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        text = element_text(size = 16),
+        axis.title = element_text(size = 16),
+        axis.text.y = element_text(size = 14))
+```
+
+Tables below report enriched GO terms for each comparison, split by upregulated and downregulated.
+
+```{r split_ck_pairwise, echo=FALSE, cache=TRUE}
+splitted_pairwise_comparisons <- as.data.frame(ck_pairwise_comparisons) %>%
+  group_by(Cluster) %>%
+  group_split()
+```
+
+###  {.tabset}
+
+#### 30 min vs 0 h
+
+##### Upregulated
+
+```{r 0_30_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[2]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_30_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[1]])
+```
+
+#### 2 h vs 0 h
+
+##### Upregulated
+
+```{r 0_2_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[4]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_2_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[3]])
+```
+
+#### 4 h vs 0 h
+
+##### Upregulated
+
+```{r 0_4_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[6]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_4_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[5]])
+```
+
+#### 8 h vs 0 h
+
+##### Upregulated
+
+```{r 0_8_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[8]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_8_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[7]])
+```
+
+#### 24 h vs 0 h
+
+##### Upregulated
+
+```{r 0_24_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[10]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_24_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[9]])
+```
+
+#### 48 h vs 0 h
+
+##### Upregulated
+
+```{r 0_48_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[12]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_48_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[11]])
+```
+
+#### 7 days vs 0 h
+
+##### Upregulated
+
+```{r 0_7d_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[14]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_7d_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[13]])
+```
+
+#### 0 h vs WT 0 h
+
+##### Upregulated
+
+```{r 0_WT_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[16]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r 0_WT_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[15]])
+```
+
+#### WT 0 h vs WT 7 days
+
+##### Upregulated
+
+```{r WT_WT7d_up, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[18]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r WT_WT7d_down, echo=FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons[[17]])
+```
+
+###  {.unnumbered}
+
+### Remove `WT_WT7D` DEG
+
+We observe that some GO terms are enriched both in contrasts generated from genetically engineered samples activated with the drug (`0_*`) and WT treated with the activating drug (`WT_WT7D`).
+
+We will filter out differentially expressed genes from the control case and calculate new GO enrichments.
+
+```{r clusterProfiler_compare_cluster_filter_wt_deg, fig.width=10, fig.height=13, cache=TRUE}
+
+fp <- all_deg %>%
+  dplyr::filter(deg 
+                & time_point == "WT_WT7D") %>%
+  dplyr::pull("gene_id")
+
+clusters <- all_deg %>%
+  dplyr::filter(deg
+                & !gene_id %in% fp) %>%
+  dplyr::mutate(gene_id = paste0("MGI:", gene_id)) %>%
+  dplyr::ungroup()
+
+ck_pairwise_comparisons_no_wt_wt7d <- compareCluster(gene_id ~ time_point + direction, 
+                     data = clusters, 
+                     fun = enrichGO,
+                     OrgDb = 'org.Mm.eg.db',
+                     keyType = "MGI",
+                     ont = "BP",
+                     universe = universe,
+                     minGSSize = 15)
+
+ck_pairwise_comparisons_no_wt_wt7d <- setReadable(ck_pairwise_comparisons_no_wt_wt7d, OrgDb = org.Mm.eg.db, keyType = "MGI")
+
+dotplot(ck_pairwise_comparisons_no_wt_wt7d, x = "time_point", showCategory = 2) + 
+  facet_grid(~direction, 
+             labeller = labeller(
+               direction = c(`1` = "upregulated",
+                             `-1` = "downregulated"
+                             ))) +
+  scale_x_discrete(limits = c("0_30", "0_2", "0_4", 
+                              "0_8", "0_24", "0_48", 
+                              "0_7D", "0_WT", "WT_WT7D")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        text = element_text(size=16),
+        axis.title = element_text(size=16),
+        axis.text.y = element_text(size=14))
+```
+
+```{r split_ck_pairwise_filter_WT_WT7D, echo=FALSE, cache=TRUE}
+splitted_pairwise_comparisons_no_WT_WT7D <- as.data.frame(ck_pairwise_comparisons_no_wt_wt7d) %>%
+  group_by(Cluster) %>%
+  group_split()
+```
+
+###  {.tabset}
+
+#### 30 min vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_30_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[1]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_30_down, echo = FALSE, cache=TRUE}
+warning("No enriched terms.")
+```
+
+#### 2 h vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_2_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[3]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_2_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[2]])
+```
+
+#### 4 h vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_4_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[5]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_4_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[4]])
+```
+
+#### 8 h vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_8_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[7]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_8_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[6]])
+```
+
+#### 24 h vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_24_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[9]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_24_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[8]])
+```
+
+#### 48 h vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_48_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[11]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_48_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[10]])
+```
+
+#### 7 days vs 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_7D_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[13]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_7D_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[12]])
+```
+
+#### 0 h vs WT 0 h
+
+##### Upregulated
+
+```{r go_WT_WT7D_filter_0_WT_up, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[15]])
+```
+
+------------------------------------------------------------------------
+
+##### Downregulated
+
+```{r go_WT_WT7D_filter_0_WT_down, echo = FALSE, cache=TRUE}
+create_go_dt(splitted_pairwise_comparisons_no_WT_WT7D[[14]])
+```
+
+###  {.unnumbered}
+
+## Transcription factor activity inference 
+
+```{r run_viper}
+
+net <- get_collectri(organism = "mouse", split_complexes = TRUE)
+
+mapping <- all_deseq2_results_tables %>% dplyr::select(gene_name, gene_id) %>% distinct()
+deg_mat_gene_names <- deg_mat
+rownames(deg_mat_gene_names) <- mapping$gene_name[match(rownames(deg_mat_gene_names), mapping$gene_id)]
+
+sample_acts <- run_viper(mat = deg_mat_gene_names, 
+                         network = net, 
+                         .source = "source", 
+                         .target = "target", 
+                         .mor = "mor", 
+                         minsize = 5)
+
+```
+
+```{r visualize_viper}
+
+n_tfs <- 10
+
+# Transform to wide matrix
+sample_acts_mat <- sample_acts %>%
+  pivot_wider(id_cols = 'condition', names_from = 'source',
+              values_from = 'score') %>%
+  column_to_rownames('condition') %>%
+  as.matrix()
+
+# Get top tfs with more variable means across clusters
+tfs <- sample_acts %>%
+  group_by(source) %>%
+  summarise(std = sd(score)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+sample_acts_mat <- sample_acts_mat[,tfs]
+
+# Scale per sample
+sample_acts_mat <- scale(sample_acts_mat)
+
+# Choose color palette
+palette_length <- 100
+my_color <- colorRampPalette(c("darkblue", "white","red"))(palette_length)
+
+my_breaks <- c(seq(-3, 0, length.out = ceiling(palette_length/2) + 1),
+               seq(0.05, 3, length.out = floor(palette_length/2)))
+
+colorder <- paste0(rep(c("0h", "30min", "2h", "4h", "8h", "24h", "48h", "7D"), 
+                       each = 3), 
+                   "_rep", 
+                   1:3)
+
+# Plot
+pheatmap(sample_acts_mat[colorder, ], border_color = NA, color = my_color, breaks = my_breaks, 
+         cluster_rows = FALSE) 
+
+```
+
+
+# Transposable Elements
+
+We will import gene expression quantification as computed using the STARTE-random methodology (@Teissandier2019). In brief, we perform standard trimming with Trimmomatic, mapping with STAR using a set of parameters permissive for multimapping reads, and FeatureCounts to quantify expression of each TE family.
+
+```{r import_te_data, cache=TRUE, warning=FALSE, message=FALSE, cache=TRUE}
+get_results_table <- function(file_path){
+  tp <- basename(dirname(dirname(file_path)))
+  
+  read_csv(file_path) %>%
+    dplyr::select(-1) %>%
+    dplyr::mutate(time_point = tp)
+}
+
+mapping_table <- read_delim("3t-seq/data/references/rmsk/mm10.gtf", 
+                            col_names = FALSE) %>%
+  dplyr::select(X9) %>%
+  dplyr::mutate(
+    repName = sub(
+      "^repName=(.+);repClass=.+;repFamily=.+;repStart=.+;repEnd=.+;repLeft=.+$", 
+      "\\1", 
+      X9
+    ),
+    repClass = sub(
+      "^repName=.+;repClass=(.+);repFamily=.+;repStart=.+;repEnd=.+;repLeft=.+$", 
+      "\\1", 
+      X9
+    ),
+    repFamily = sub(
+      "^repName=.+;repClass=.+;repFamily=(.+);repStart=.+;repEnd=.+;repLeft=.+$", 
+      "\\1", 
+      X9
+    )
+  ) %>%
+  dplyr::select(-X9) %>%
+  dplyr::distinct()
+
+lfc_table <- list.files("3t-seq/data/results/alignments/starTE",
+           pattern = "lfc.txt",
+           full.names = TRUE,
+           recursive = TRUE) %>%
+  purrr::map(get_results_table) %>%
+  purrr::reduce(bind_rows) %>%
+  dplyr::left_join(
+    mapping_table, 
+    by = c("gene_name" = "repName"), 
+    multiple="all"
+    )
+
+```
+
+## TE from @Dura2022
+
+We will pick TE as shown in [Figure 1F](https://www.nature.com/articles/s41588-022-01040-z/figures/1) of @Dura2022.
+
+Unfortunately, not all displayed TE could be detected in this dataset. The list below shows the missing genes.
+
+```{r select_te, cache=TRUE}
+
+line1 <- c("L1MdA_I", "L1MdA_II", "L1MdA_III", "L1MdA_IV", 
+           "L1MdA_V", "L1MdA_VI", "L1MdA_VII", "L1MdTf_I",
+           "L1MdTf_II", "L1MdTf_III", "L1MdF_II", "L1MdGf_I", 
+           "L1MdGf_II")
+
+sine <- c("B2_Mm1a", "B1_Mm")
+
+erv1 <- c("MURVY-int", "MMERGLN-int", "MMERGLN_LTR")
+
+ervk <- c("MMERVK10C-int", "IAPEz_int", "IAPEy-int", "IAPd-int",
+          "ETnERV2-int", "ETnERV3-int", "RLTR10-int")
+
+ervl <- c("ORR1A1-int", "ORR1A0-int", "ORR1A0", "MERVL-int")
+
+selected <- c(line1, sine, erv1, ervk, ervl)
+
+setdiff(selected, lfc_table$gene_name)
+```
+
+We will first produce a heatmap similar to the Figure from the paper above.
+
+```{r plot_te_heatmap, fig.width=10, fig.height=5, cache=TRUE}
+as_matrix <- function(df) {
+  rn <- df$gene_name
+  mat <- as.matrix(df[,-1])
+  rownames(mat) <- rn
+  return(mat)
+}
+
+mat <- lfc_table %>%
+  dplyr::filter(gene_name %in% selected) %>%
+  pivot_wider(names_from = time_point,
+              values_from = log2FoldChange,
+              id_cols = gene_name) %>%
+  as_matrix()
+
+available_te <- intersect(selected, rownames(mat))
+
+mat <- mat[available_te, c("0_30", "0_2", "0_4", 
+                           "0_8", "0_24", "0_48", 
+                           "0_7D", "0_WT", "WT_WT7D")]
+
+rowann <- data.frame(
+  row.names = available_te,
+  class = mapping_table %>% 
+    dplyr::filter(repName %in% available_te) %>% 
+    dplyr::pull("repClass"),
+  family = mapping_table %>% 
+    dplyr::filter(repName %in% available_te) %>% 
+    dplyr::pull("repFamily")
+)
+
+pheatmap(t(mat),
+         color = colorRampPalette(
+           rev(brewer.pal(n = 5, name = "RdBu")))(100),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         annotation_col = rowann)
+```
+
+We will also produce a line plot showing the same data.
+
+```{r plot_te_lines, fig.height=10, fig.width=10, warning=FALSE, message=FALSE, cache=TRUE}
+lfc_table %>%
+  dplyr::filter(gene_name %in% selected) %>%
+  ggplot2::ggplot(aes(time_point, log2FoldChange, group = gene_name)) +
+  geom_line() +
+  facet_wrap( ~ repClass + repFamily) +
+  theme_bw(base_size = 16) +
+  theme(aspect.ratio = 1, 
+        strip.background = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## All differentially expressed TE
+
+We will produce similar visualizations using differentially expressed TE from DESeq2 analysis as performed by the 3t-seq pipeline.
+
+Fist we will call DE TE using thresholds defined above.
+
+```{r call_te_deg, cache=TRUE}
+te_de <- lfc_table %>%
+  dplyr::mutate(deg = log2FoldChange > lfc_thr
+               & ifelse(is.na(padj), pvalue < pval_thr, padj < pval_thr))
+```
+
+We will produce a clustered heatmap.
+
+```{r pheatmat_te_de, fig.height=10, fig.width=7, cache=TRUE}
+
+mat <- te_de  %>%
+  dplyr::filter(deg & gene_name != "Eulor5A") %>%
+  tidyr::pivot_wider(
+    id_cols = gene_name, 
+    values_from = log2FoldChange, 
+    names_from = time_point, 
+    values_fill = NA) %>%
+  as_matrix 
+
+rowann <- data.frame(
+  row.names = rownames(mat),
+  class = mapping_table %>% 
+    dplyr::filter(repName %in% rownames(mat)) %>% 
+    dplyr::pull("repClass"),
+  family = mapping_table %>% 
+    dplyr::filter(repName %in% rownames(mat)) %>% 
+    dplyr::pull("repFamily")
+)
+
+mat <- mat[, c("0_30", "0_2", "0_4", 
+               "0_8", "0_24", "0_48", 
+               "0_7D", "0_WT", "WT_WT7D")]
+
+pheatmap(mat,
+         color = colorRampPalette(
+           brewer.pal(n = 5, name = "Purples"))(100),
+         na_col = "grey70", 
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE,
+         annotation_row = rowann,
+         show_rownames = FALSE)
+```
+
+It looks like pairwise calls for differentially expressed TE result in sparse data. Temporal clustering will do better?
+
+# References
