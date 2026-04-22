@@ -1,10 +1,16 @@
 ---
 title: "OGT_analysis"
+execute: 
+  warning: false
 format:
   html:
+    theme: minty
+    code-tools: true
     toc: true
     toc-depth: 3
     embed-resources: true
+    code-block-bg: true
+    highlight-style: github
 ---
 
 ## Packages
@@ -25,6 +31,7 @@ mutate <- dplyr::mutate
 select <- dplyr::select
 group_by <- dplyr::group_by
 filter <- dplyr::filter
+count <- dplyr::count
 ```
 
 ## Graphics
@@ -83,6 +90,7 @@ res_ogt_glyco$TMT_info <- data.frame(
 
 
 ```{r}
+setwd("~/Documents/01_repos/help/OGT/")
 res_ogt_glyco$FP <- read_tsv("protein.tsv")
 
 # repair columnames
@@ -554,12 +562,13 @@ int <- decoupler_results %>%
 p<- decoupler_results %>%
   filter(statistic == "norm_wmean" & source %in% int$source) %>%
   mutate(n_sig_proteins = str_count(members, "|")) %>% 
-  ggplot(aes(y = reorder(source, score), x= score, colour = condition, label = n_sig_proteins)) +
+  ggplot(aes(y = reorder(source, score), x= abs(score), fill = condition, label = n_sig_proteins)) +
   geom_vline(xintercept = 0, linetype = 1) +
-  geom_vline(xintercept = c(-3,3), linetype =3) +
-  geom_point() +
-  scale_colour_manual(values = c("#F2F0F7", "#DADAEB", "#BCBDDC", "#9E9AC8", "#756BB1", "#54278F")) +
-  labs(x="pathway enirchment score", y = "")
+  geom_vline(xintercept = c(3), linetype =3) +
+  geom_point(size = 3, shape = 21, colour = "darkgrey") +
+  #scale_size(range = c(2,4)) +
+  scale_fill_manual(values = c("#F2F0F7", "#DADAEB", "#BCBDDC", "#9E9AC8", "#756BB1", "#54278F")) +
+  labs(x="absolute pathway enirchment score", y = "")
 p
 ```
 
@@ -742,11 +751,11 @@ psm_glyco %>%
 ```{r}
 psm_glyco %>% 
   filter(time != "168h") %>% 
-  group_by(Gene, Protein.Start, time, replicate) %>% 
+  group_by(Gene, Start_AA, time, replicate) %>% 
   summarise(intensity = sum(intensity)) %>% 
-  group_by(Gene, Protein.Start, time) %>% 
+  group_by(Gene, Start_AA, time) %>% 
   summarise(intensity = mean(intensity)) %>% 
-  group_by(Gene, Protein.Start) %>% 
+  group_by(Gene, Start_AA) %>% 
   mutate(scaled_int = scale(log2(intensity))) %>% 
   drop_na() %>% 
   ggplot(aes(x=time, y=scaled_int)) +
@@ -758,7 +767,7 @@ psm_glyco %>%
 
 ## 2. Visualise O-glycoproteins
 
-```{r}
+```{r, eval = F}
 glycoproteins <- unique(psm_glyco$Gene)
 
 for (p in glycoproteins) {
@@ -777,24 +786,6 @@ for (p in glycoproteins) {
 
 ```{r}
 
-```
-
-
-# Overlaps of datasets
-
-```{r}
-res_ogt_glyco$limma_results %>% filter(hit == "hit") %>% 
-  mutate(annotation  = ifelse(Gene  %in% psm_glyco$Gene, "glycoprotein", "other")) %>% 
-  filter(annotation == "glycoprotein") %>%  select(Gene, logFC, contrast, direction)
-  distinct(Gene)
-  group_by(annotation, direction, contrast) %>% 
-  count
-
-res_ogt_glyco$limma_results %>%
-  mutate(annotation = ifelse(Gene %in% psm_glyco$Gene, "glycoprotein", "other")) %>%
-  distinct(Gene, annotation, hit) %>%
-  group_by(annotation, hit) %>%
-  count()
 ```
 
 
