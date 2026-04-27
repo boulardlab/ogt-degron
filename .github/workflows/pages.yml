@@ -29,10 +29,13 @@ jobs:
 
       - name: Render Quarto project
         run: quarto render
+        
+      - name: Debug - list output
+        run: ls -la _site/ || echo "_site does not exist
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
-
+        
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
