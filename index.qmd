@@ -1,0 +1,10 @@
+---
+title: "O-GlcNAc Multiomics Data Analysis"
+---
+
+## Analyses
+
+Explore the two components of this multiomics study:
+
+- [RNA-seq Analysis](analysis.html) — Transcriptomic profiling of O-GlcNAc-related gene expression changes.
+- [Proteomics Analysis](DQGlyco_analysis/OGT_analysis.html) — OGT-dependent glycoproteomics and protein abundance analysis.

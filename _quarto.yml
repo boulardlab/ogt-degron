@@ -1,0 +1,24 @@
+project:
+  type: website
+  render:
+    - "*.qmd"
+    - "index.qmd"
+
+website:
+  title: "O-GlCNaC multiomics data analysis"
+  navbar:
+    left:
+      - href: index.qmd
+      - href: analysis.html
+        text: RNA-seq
+      - href: DQGlyco_analysis/OGT_analysis.html
+        text: Proteomics
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+
+
+
