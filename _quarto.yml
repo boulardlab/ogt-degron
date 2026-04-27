@@ -2,9 +2,9 @@ project:
   type: website
   output-dir: _site
   render:
-    - "!**/*.Rmd"
-    - "!**/*.qmd"
-    - "*.qmd"
+    - "index.qmd"
+    - "analysis.html"
+    - "DQGlyco_analysis/OGT_analysis.html"
 
 website:
   title: "O-GlCNaC multiomics data analysis"
