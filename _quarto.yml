@@ -1,8 +1,9 @@
 project:
   type: website
   render:
+    - "!**/*.Rmd"
+    - "!**/*.qmd"
     - "*.qmd"
-    - "index.qmd"
 
 website:
   title: "O-GlCNaC multiomics data analysis"
